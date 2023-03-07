@@ -14,6 +14,7 @@ import java.io.InputStream;
 import java.net.Authenticator;
 import java.net.PasswordAuthentication;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -33,6 +34,7 @@ public class DownloadRepository implements Runnable {
 
 	private final String url;
 	private final String repositoryId;
+	private final UploadRepository uploader;
 	private Path downloadPath;
 
 	private boolean authenticate;
@@ -46,7 +48,8 @@ public class DownloadRepository implements Runnable {
 	private AtomicLong assetFound = new AtomicLong();
 
 
-	public DownloadRepository(String url, String repositoryId, String downloadPath, boolean authenticate, String username, String password) {
+	public DownloadRepository(String url, String repositoryId, String downloadPath, boolean authenticate, String username, String password, UploadRepository uploader) {
+		this.uploader = uploader;
 		this.url = requireNonNull(url);
 		this.repositoryId = requireNonNull(repositoryId);
 		this.downloadPath = downloadPath == null ? null : Paths.get(downloadPath);
@@ -64,7 +67,7 @@ public class DownloadRepository implements Runnable {
 				throw new IOException("Not a writable directory: " + downloadPath);
 
 			LOGGER.info("Starting download of Nexus 3 repository in local directory {}", downloadPath);
-			executorService = Executors.newFixedThreadPool(10);
+			executorService = Executors.newFixedThreadPool(1);
 	
 			if (authenticate) {
 				LOGGER.info("Configuring authentication for Nexus 3 repository");
@@ -161,29 +164,49 @@ public class DownloadRepository implements Runnable {
 
 		@Override
 		public void run() {
-			LOGGER.info("Downloading asset <{}>", item.getDownloadUrl());
+			LOGGER.info("Downloading item <{}>", item.getDownloadUrl());
+
+			boolean done=false;
+			Path assetPath = null;
 
 			try {
-				Path assetPath = downloadPath.resolve(item.getPath());
+				assetPath = downloadPath.resolve(item.getPath());
 				Files.createDirectories(assetPath.getParent());
 				final URI downloadUri = URI.create(item.getDownloadUrl());
+				if (assetPath.toFile().exists()) assetPath.toFile().delete();
 				int tryCount = 1;
 				while (tryCount <= 3) {
 					try (InputStream assetStream = downloadUri.toURL().openStream()) {
 						Files.copy(assetStream, assetPath);
 						final HashCode hash = com.google.common.io.Files.asByteSource(assetPath.toFile()).hash(Hashing.sha1());
-						if (Objects.equals(hash.toString(), item.getChecksum().getSha1()))
+						if (Objects.equals(hash.toString(), item.getChecksum().getSha1())) {
+							done=true;
 							break;
+						}
 						tryCount++;
 						LOGGER.info("Download failed, retrying");
 					}
 				}
-				assetProcessed.incrementAndGet();
-				notifyProgress();
 			}
 			catch (IOException e) {
-				LOGGER.error("Failed to download asset <" + item.getDownloadUrl() + ">", e);
+				LOGGER.error("Failed to download item <" + item.getDownloadUrl() + ">", e);
 			}
+
+			try {
+				if (done) {
+					assetProcessed.incrementAndGet();
+					notifyProgress();
+					DownloadRepository.this.uploader.uploadItem(item,assetPath);
+
+				} else {
+					LOGGER.info("Download finally failed!");
+				}
+			}
+			catch (Exception e) {
+				LOGGER.error("Failed to upload item <" + item.getDownloadUrl() + ">", e);
+			}
+			LOGGER.info("Done");
+
 		}
 	}
 }
